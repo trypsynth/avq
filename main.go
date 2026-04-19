@@ -9,138 +9,150 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/html"
 )
 
-type category struct {
-	name string
-	url  string
+const (
+	baseURL   = "https://audiovault.net"
+	userAgent = "avq/0.1"
+)
+
+type result struct {
+	titles []string
+	err    error
 }
 
-func fetchTitles(client *http.Client, endpoint string) ([]string, error) {
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+func main() {
+	showMovies := flag.Bool("m", false, "Search movies")
+	showTV := flag.Bool("t", false, "Search TV shows")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <query>\n", os.Args[0])
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+	query := strings.TrimSpace(strings.Join(flag.Args(), " "))
+	if query == "" {
+		flag.Usage()
+		os.Exit(2)
+	}
+	if !*showMovies && !*showTV {
+		*showMovies, *showTV = true, true
+	}
+	endpoints := make(map[string]string)
+	if *showMovies {
+		endpoints["Movies"] = baseURL + "/movies"
+	}
+	if *showTV {
+		endpoints["TV Shows"] = baseURL + "/shows"
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	resChan := make(chan result, len(endpoints))
+	var wg sync.WaitGroup
+	for name, path := range endpoints {
+		wg.Add(1)
+		go func(n, p string) {
+			defer wg.Done()
+			titles, err := fetch(client, p, query)
+			if err != nil {
+				resChan <- result{err: fmt.Errorf("[%s] %w", n, err)}
+				return
+			}
+			resChan <- result{titles: titles}
+		}(name, path)
+	}
+	go func() {
+		wg.Wait()
+		close(resChan)
+	}()
+	found := false
+	for res := range resChan {
+		if res.err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", res.err)
+			continue
+		}
+		for _, t := range res.titles {
+			fmt.Println(t)
+			found = true
+		}
+	}
+	if !found {
+		fmt.Println("No results found.")
+	}
+}
+
+func fetch(client *http.Client, target, query string) ([]string, error) {
+	u, err := url.Parse(target)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "avq/0.1")
+	q := u.Query()
+	q.Set("search", query)
+	u.RawQuery = q.Encode()
+	req, _ := http.NewRequest(http.MethodGet, u.String(), nil)
+	req.Header.Set("User-Agent", userAgent)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("request failed: %s", resp.Status)
+		return nil, fmt.Errorf("server returned %d", resp.StatusCode)
 	}
-	ct := resp.Header.Get("Content-Type")
-	if !strings.Contains(ct, "text/html") {
-		return nil, fmt.Errorf("unexpected content type: %s", ct)
-	}
-	return parseTitles(resp.Body)
+	return parse(resp.Body)
 }
 
-func parseTitles(r io.Reader) ([]string, error) {
+func parse(r io.Reader) ([]string, error) {
 	doc, err := html.Parse(r)
 	if err != nil {
 		return nil, err
 	}
 	var titles []string
-	var walk func(*html.Node)
-	walk = func(n *html.Node) {
+	var f func(*html.Node)
+	f = func(n *html.Node) {
 		if n.Type == html.ElementNode && n.Data == "tr" {
-			tds := tdElements(n)
-			if len(tds) >= 2 {
-				text := strings.Join(strings.Fields(textContent(tds[1])), " ")
-				text = stdhtml.UnescapeString(text)
-				if text != "" {
-					titles = append(titles, text)
-				}
+			if title := extractTitleFromRow(n); title != "" {
+				titles = append(titles, title)
 			}
 		}
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
+			f(c)
 		}
 	}
-	walk(doc)
+	f(doc)
 	return titles, nil
 }
 
-func tdElements(row *html.Node) []*html.Node {
-	var tds []*html.Node
+func extractTitleFromRow(row *html.Node) string {
+	tdCount := 0
 	for c := row.FirstChild; c != nil; c = c.NextSibling {
 		if c.Type == html.ElementNode && c.Data == "td" {
-			tds = append(tds, c)
+			tdCount++
+			if tdCount == 2 {
+				rawText := flattenText(c)
+				return stdhtml.UnescapeString(strings.Join(strings.Fields(rawText), " "))
+			}
 		}
 	}
-	return tds
+	return ""
 }
 
-func textContent(n *html.Node) string {
+func flattenText(n *html.Node) string {
+	if n.Type == html.TextNode {
+		return n.Data
+	}
 	var b strings.Builder
-	var walk func(*html.Node)
-	walk = func(node *html.Node) {
+	var f func(*html.Node)
+	f = func(node *html.Node) {
 		if node.Type == html.TextNode {
 			b.WriteString(node.Data)
 		}
 		for c := node.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
+			f(c)
 		}
 	}
-	walk(n)
+	f(n)
 	return b.String()
-}
-
-func main() {
-	movies := flag.Bool("m", false, "include movies")
-	shows := flag.Bool("t", false, "include TV shows")
-	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [flags] <query>\n\n", os.Args[0])
-		fmt.Fprintln(flag.CommandLine.Output(), "Query the Audiovault for movies and TV shows.")
-		fmt.Fprintln(flag.CommandLine.Output(), "Flags:")
-		flag.PrintDefaults()
-	}
-	flag.Parse()
-	if flag.NArg() == 0 {
-		flag.Usage()
-		os.Exit(2)
-	}
-	includeMovies := *movies
-	includeShows := *shows
-	if !*movies && !*shows {
-		includeMovies = true
-		includeShows = true
-	}
-	query := strings.Join(flag.Args(), " ")
-	var categories []category
-	if includeMovies {
-		categories = append(categories, category{
-			name: "movies",
-			url:  "https://audiovault.net/movies",
-		})
-	}
-	if includeShows {
-		categories = append(categories, category{
-			name: "shows",
-			url:  "https://audiovault.net/shows",
-		})
-	}
-	client := &http.Client{Timeout: 15 * time.Second}
-	var results []string
-	for _, cat := range categories {
-		endpoint := fmt.Sprintf("%s?search=%s", cat.url, url.QueryEscape(query))
-		titles, err := fetchTitles(client, endpoint)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to query %s: %v\n", cat.name, err)
-			os.Exit(1)
-		}
-		results = append(results, titles...)
-	}
-	if len(results) == 0 {
-		fmt.Println("No results.")
-		return
-	}
-	for _, item := range results {
-		fmt.Println(item)
-	}
 }
